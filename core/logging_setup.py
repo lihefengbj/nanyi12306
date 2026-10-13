@@ -1,7 +1,7 @@
 """日志模块：滚动文件日志 + 控制台输出。
 
 日志文件: <数据目录>/logs/nanyi12306.log（单文件 2MB，保留 5 份）
-所有 12306 接口的请求与原始响应（截断）都会记录，便于反馈问题时定位。
+记录接口元信息（状态码、Content-Type、最终 URL、响应类型），不记录请求值、Cookie 或响应正文。
 """
 import logging
 from logging.handlers import RotatingFileHandler

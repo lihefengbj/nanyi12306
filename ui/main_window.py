@@ -14,6 +14,7 @@ from core.stations import StationTable
 from core.worker import GrabTask, GrabWorker
 
 from .login_page import LoginPage
+from .log_dialog import LogDialog
 from .monitor_page import MonitorPage
 from .settings_page import SettingsPage
 from .task_page import TaskPage
@@ -36,6 +37,11 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("nanyi12306 - 火车票自动购票")
         self.resize(960, 640)
+
+        log_menu = self.menuBar().addMenu("日志(&L)")
+        view_log_action = QAction("查看运行日志", self)
+        view_log_action.triggered.connect(self._show_logs)
+        log_menu.addAction(view_log_action)
 
         # Core 上下文
         self.session = Session()
@@ -115,8 +121,8 @@ class MainWindow(QMainWindow):
             self.login_page.start()
 
     def _on_logged_in(self, name: str = "") -> None:
-        if not name:
-            name = self.auth.get_user_name()
+        # Session verification already succeeded in the QR thread. Do not
+        # block the GUI on an optional username lookup before updating state.
         self.user_label.setText(f"已登录: {name}" if name else "已登录")
         self.stack.setCurrentIndex(1)
         self.task_page.load_passengers()
@@ -140,6 +146,9 @@ class MainWindow(QMainWindow):
             tray=self.tray,
         )
         self.statusBar().showMessage(f"下单成功: {order_id}")
+
+    def _show_logs(self) -> None:
+        LogDialog(self).exec()
 
     # ---------- 关闭 ----------
 
