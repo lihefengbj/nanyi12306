@@ -1,4 +1,5 @@
 """任务配置页：查询余票、勾选车次、设置席别优先级与乘车人，启动抢票。"""
+import logging
 import uuid
 
 from PySide6.QtCore import QDate, Qt, QTime, QThread, Signal
@@ -9,10 +10,13 @@ from PySide6.QtWidgets import (
 )
 
 from core.auth import Auth, Passenger
-from core.query import TicketFilter, TrainTicket, query_tickets
+from core.query import TicketFilter, TrainTicket, apply_filter, query_tickets
 from core.worker import GrabTask
 
 from .widgets import StationEdit
+
+log = logging.getLogger("ny12306.passengers")
+query_log = logging.getLogger("ny12306.query")
 
 
 class QueryWorker(QThread):
@@ -41,8 +45,11 @@ class PassengerWorker(QThread):
 
     def run(self):
         try:
-            self.sig_result.emit(self._auth.get_passengers())
+            passengers = self._auth.get_passengers()
+            log.info("乘车人查询完成，数量=%d", len(passengers))
+            self.sig_result.emit(passengers)
         except Exception as exc:
+            log.warning("乘车人加载失败: %s", exc)
             self.sig_error.emit(str(exc))
 
 
@@ -53,7 +60,9 @@ class TaskPage(QWidget):
         super().__init__(parent)
         self._ctx = app_ctx  # {"session": Session, "stations": StationTable, "auth": Auth}
         self._trains: list[TrainTicket] = []
+        self._query_loaded = False
         self._passengers: list[Passenger] = []
+        self._passenger_worker: PassengerWorker | None = None
         self._build_ui()
 
     # ---------- UI ----------
@@ -80,7 +89,9 @@ class TaskPage(QWidget):
         # 行2：车次列表
         self.train_list = QListWidget()
         self.train_list.setMinimumHeight(180)
-        root.addWidget(QLabel("查询结果（勾选要抢的车次，不勾则全部监控）："))
+        self.train_hint = QLabel("查询结果（勾选要抢的车次，不勾则监控时间窗内所有车次）：")
+        self.train_hint.setWordWrap(True)
+        root.addWidget(self.train_hint)
         root.addWidget(self.train_list)
 
         # 行3：席别优先级 + 乘车人
@@ -104,14 +115,13 @@ class TaskPage(QWidget):
         pass_scroll.setWidget(pass_inner)
         pb_layout = QVBoxLayout(pass_box)
         pb_layout.addWidget(pass_scroll)
-        self.pass_hint = QLabel("")
+        self.pass_hint = QLabel("请先完成登录；扫码确认后还需建立业务会话")
         self.pass_hint.setStyleSheet("color: #c62828;")
         self.pass_hint.setWordWrap(True)
-        self.pass_hint.hide()
         pb_layout.addWidget(self.pass_hint)
-        refresh_btn = QPushButton("刷新乘车人")
-        refresh_btn.clicked.connect(self.load_passengers)
-        pb_layout.addWidget(refresh_btn)
+        self.refresh_passengers_btn = QPushButton("刷新乘车人")
+        self.refresh_passengers_btn.clicked.connect(self.load_passengers)
+        pb_layout.addWidget(self.refresh_passengers_btn)
         row3.addWidget(pass_box)
         root.addLayout(row3)
 
@@ -120,11 +130,17 @@ class TaskPage(QWidget):
         row4.addWidget(QLabel("出发时间窗"))
         self.time_from = QTimeEdit(QTime(0, 0))
         self.time_to = QTimeEdit(QTime(23, 59))
+        for edit in (self.time_from, self.time_to):
+            edit.setDisplayFormat("HH:mm")
+            edit.setToolTip("按所选日期的出发时间过滤，包含起止时间；结束时间不得早于开始时间")
+            edit.timeChanged.connect(self._render_trains)
         row4.addWidget(self.time_from)
         row4.addWidget(QLabel("~"))
         row4.addWidget(self.time_to)
-        self.cb_candidate = QCheckBox("无票时自动提交候补")
-        self.cb_candidate.setChecked(True)
+        self.cb_candidate = QCheckBox("自动候补（暂不可用）")
+        self.cb_candidate.setChecked(False)
+        self.cb_candidate.setEnabled(False)
+        self.cb_candidate.setToolTip("候补链路尚未验证，请通过 12306 App 提交候补")
         self.cb_no_seat = QCheckBox("接受无座兜底")
         row4.addWidget(self.cb_candidate)
         row4.addWidget(self.cb_no_seat)
@@ -140,15 +156,23 @@ class TaskPage(QWidget):
     # ---------- 行为 ----------
 
     def load_passengers(self) -> None:
-        self.pass_hint.hide()
-        self.pass_hint.setText("")
+        if self._passenger_worker and self._passenger_worker.isRunning():
+            return
+        self.pass_hint.setStyleSheet("color: #555;")
+        self.pass_hint.setText("正在加载乘车人…")
+        self.pass_hint.show()
+        self.refresh_passengers_btn.setEnabled(False)
         w = PassengerWorker(self._ctx["auth"], self)
+        self._passenger_worker = w
         w.sig_result.connect(self._fill_passengers)
         w.sig_error.connect(self._passengers_error)
+        w.finished.connect(self._passenger_load_finished)
         w.start()
 
     def _fill_passengers(self, passengers: list[Passenger]) -> None:
         self._passengers = passengers
+        self.pass_hint.setText("账号没有可显示的常用乘车人")
+        self.pass_hint.setVisible(not passengers)
         while self.pass_layout.count():
             item = self.pass_layout.takeAt(0)
             if item.widget():
@@ -161,10 +185,20 @@ class TaskPage(QWidget):
         self.pass_layout.addStretch(1)
 
     def _passengers_error(self, msg: str) -> None:
+        self.pass_hint.setStyleSheet("color: #c62828;")
         self.pass_hint.setText(f"乘车人加载失败：{msg}\n请确认已登录后点击「刷新乘车人」")
         self.pass_hint.show()
 
+    def _passenger_load_finished(self) -> None:
+        worker = self.sender()
+        if worker is self._passenger_worker:
+            self._passenger_worker = None
+            self.refresh_passengers_btn.setEnabled(True)
+
     def _do_query(self) -> None:
+        if not self._valid_time_window():
+            QMessageBox.warning(self, "提示", "出发时间窗的结束时间不能早于开始时间")
+            return
         from_code, to_code = self.from_edit.selected_code(), self.to_edit.selected_code()
         if not from_code or not to_code:
             QMessageBox.warning(self, "提示", "请从补全列表中选择有效的出发地和目的地")
@@ -182,14 +216,55 @@ class TaskPage(QWidget):
         self.query_btn.setEnabled(True)
         self.query_btn.setText("查询余票")
         self._trains = trains
+        self._query_loaded = True
         self.train_list.clear()
+        self._render_trains()
+
+    def _valid_time_window(self) -> bool:
+        return self.time_from.time() <= self.time_to.time()
+
+    def _render_trains(self) -> None:
+        checked_codes = {
+            self.train_list.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(self.train_list.count())
+            if self.train_list.item(i).checkState() == Qt.CheckState.Checked
+        }
+        self.train_list.clear()
+        if not self._valid_time_window():
+            self.train_hint.setText("出发时间窗无效：结束时间不能早于开始时间")
+            return
+        if not self._query_loaded:
+            self.train_hint.setText(
+                "查询结果（勾选要抢的车次，不勾则监控时间窗内所有车次）：")
+            return
+        flt = TicketFilter(
+            time_from=self.time_from.time().toString("HH:mm"),
+            time_to=self.time_to.time().toString("HH:mm"),
+            only_available=False,
+        )
+        trains = apply_filter(self._trains, flt)
+        if trains:
+            self.train_hint.setText(
+                f"查询结果（{flt.time_from}–{flt.time_to}，"
+                f"显示 {len(trains)}/{len(self._trains)} 条；"
+                "不勾则监控时间窗内所有车次）：")
+        else:
+            self.train_hint.setText(
+                f"{flt.time_from}–{flt.time_to} 内暂无符合条件的车次"
+                f"（查询返回 {len(self._trains)} 条）")
+        query_log.info(
+            "出发时间过滤 %s-%s: 查询返回=%d 展示=%d",
+            flt.time_from, flt.time_to, len(self._trains), len(trains),
+        )
         for t in trains:
             seat_info = "  ".join(
                 f"{k}:{v}" for k, v in t.seats.items() if v and v != "无")
             item = QListWidgetItem(
                 f"{t.code}  {t.start_time}→{t.arrive_time} ({t.duration})  {seat_info}")
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Unchecked)
+            item.setCheckState(
+                Qt.CheckState.Checked if t.code in checked_codes
+                else Qt.CheckState.Unchecked)
             item.setData(Qt.ItemDataRole.UserRole, t.code)
             self.train_list.addItem(item)
 
@@ -199,6 +274,9 @@ class TaskPage(QWidget):
         QMessageBox.warning(self, "查询失败", msg)
 
     def _start_task(self) -> None:
+        if not self._valid_time_window():
+            QMessageBox.warning(self, "提示", "出发时间窗的结束时间不能早于开始时间")
+            return
         from_code, to_code = self.from_edit.selected_code(), self.to_edit.selected_code()
         if not from_code or not to_code:
             QMessageBox.warning(self, "提示", "请选择出发地和目的地")

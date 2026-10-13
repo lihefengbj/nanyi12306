@@ -11,6 +11,7 @@ STATUS_COLORS = {
     "监控中": "#2e7d32", "下单中": "#f9a825", "排队中": "#f9a825",
     "已下单": "#1565c0", "候补中": "#6a1b9a", "失败": "#c62828",
     "登录失效": "#c62828", "已停止": "#616161",
+    "需人工处理": "#c62828",
 }
 
 
@@ -47,7 +48,7 @@ class TaskCard(QGroupBox):
         f = self.worker.task.filter
         lines = []
         for t in trains:
-            if f.train_codes and t.code not in f.train_codes:
+            if not f.match_train(t):
                 continue
             seat_info = "  ".join(
                 f"{k}:{v}" for k, v in t.seats.items()

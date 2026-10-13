@@ -8,7 +8,7 @@ from PySide6.QtCore import QThread, Signal
 
 from .auth import Passenger
 from .config import load_config
-from .order import (AuthExpiredError, NoTicketError, OrderError,
+from .order import (AuthExpiredError, ManualActionError, NoTicketError, OrderError,
                     QueueResult, submit_candidate, submit_order)
 from .query import TicketFilter, TrainTicket, query_tickets
 from .session import Session
@@ -27,7 +27,7 @@ class GrabTask:
     to_name: str
     filter: TicketFilter = field(default_factory=TicketFilter)
     passengers: list[Passenger] = field(default_factory=list)
-    auto_candidate: bool = True    # 无票自动候补
+    auto_candidate: bool = False   # 候补链路未验证，默认关闭
     accept_no_seat: bool = False   # 无座兜底
 
     def title(self) -> str:
@@ -56,7 +56,8 @@ class GrabWorker(QThread):
         cfg = load_config()
         interval = max(1.5, float(cfg.get("poll_interval", 2.0)))
         jitter = max(0.0, float(cfg.get("poll_jitter", 1.0)))
-        backoff = 1.0
+        query_backoff = max(3.0, interval)
+        order_backoff = 5.0
         self.sig_status.emit("监控中")
         self.log(f"任务启动：{self.task.title()}")
         while not self._stop:
@@ -66,17 +67,28 @@ class GrabWorker(QThread):
                     self.task.from_code, self.task.to_code)
                 self.poll_count += 1
                 self.sig_tickets.emit(trains)
-                backoff = 1.0
+            except Exception as exc:
+                self.log(f"余票查询异常：{exc}（{query_backoff:.0f}s 后重试）")
+                self._sleep(query_backoff)
+                query_backoff = min(query_backoff * 2, 30.0)
+                continue
+            query_backoff = max(3.0, interval)
+            try:
                 if self._try_grab(trains):
                     return
             except AuthExpiredError:
                 self.sig_status.emit("登录失效")
                 self.log("登录状态已失效，请重新扫码登录")
                 return
+            except ManualActionError as exc:
+                self.sig_status.emit("需人工处理")
+                self.log(str(exc))
+                return
             except Exception as exc:
-                self.log(f"轮询异常：{exc}（{backoff:.0f}s 后重试）")
-                self._sleep(backoff)
-                backoff = min(backoff * 2, 30.0)
+                self.sig_status.emit("监控中")
+                self.log(f"下单异常：{exc}（{order_backoff:.0f}s 后重试）")
+                self._sleep(max(interval, order_backoff))
+                order_backoff = min(order_backoff * 2, 30.0)
                 continue
             self._sleep(interval + random.uniform(0, jitter))
         self.sig_status.emit("已停止")
@@ -91,11 +103,7 @@ class GrabWorker(QThread):
                 return True
             if not t.can_buy:
                 continue
-            if f.train_codes and t.code not in f.train_codes:
-                continue
-            if f.time_from and t.start_time < f.time_from:
-                continue
-            if f.time_to and t.start_time > f.time_to:
+            if not f.match_train(t):
                 continue
             seat = f.pick_seat(t)
             if seat is None and self.task.accept_no_seat and t.seat_available("无座"):
@@ -103,8 +111,8 @@ class GrabWorker(QThread):
             if seat is None:
                 continue
             self.log(f"命中 {t.code} {seat}（{t.start_time} 发车），尝试下单")
-            if self._do_order(t, seat):
-                return True
+            # One submission attempt per polling round on the shared account.
+            return self._do_order(t, seat)
         return False
 
     def _do_order(self, t: TrainTicket, seat: str) -> bool:
@@ -139,6 +147,8 @@ class GrabWorker(QThread):
                 self.log(f"候补订单已受理：{outcome.order_id}")
                 return True
             self.log(f"候补提交失败：{outcome.message}")
+        except (AuthExpiredError, ManualActionError):
+            raise
         except OrderError as exc:
             self.log(f"候补提交异常：{exc}")
         return False
