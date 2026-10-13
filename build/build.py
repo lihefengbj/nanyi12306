@@ -36,9 +36,10 @@ def main() -> int:
             args += ["--icon", str(ROOT / "assets" / "app.icns")]
         args += ["--osx-bundle-identifier", "com.nanyi12306.app"]
     else:
-        print(f"不支持的平台: {system}")
+        print(f"Unsupported platform: {system}")
         return 1
-    print("运行:", " ".join(args))
+    # CI runner consoles may be non-UTF-8 (e.g. cp1252); keep output ASCII-safe.
+    print("Run:", " ".join(args))
     return subprocess.call(args, cwd=ROOT)
 
 
