@@ -10,7 +10,8 @@ from core.logging_setup import setup_logging
 
 def main() -> int:
     log_file = setup_logging()
-    logging.getLogger("ny12306").info("应用启动，日志文件: %s", log_file)
+    logging.getLogger("ny12306").info(
+        "应用启动，登录流程=scoped-cookie-passport-v2，日志文件: %s", log_file)
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
