@@ -1,0 +1,53 @@
+name: build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows
+            os: windows-latest
+            artifact: dist/nanyi12306.exe
+          - name: macos-arm64
+            os: macos-latest
+            artifact: dist/nanyi12306.app
+          - name: macos-intel
+            os: macos-13
+            artifact: dist/nanyi12306.app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: 离线测试
+        run: python -m unittest discover -s tests -q
+
+      - name: PyInstaller 打包
+        run: python build/build.py
+
+      - name: 整理 macOS 产物
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent dist/nanyi12306.app dist/nanyi12306-${{ matrix.name }}.zip
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: nanyi12306-${{ matrix.name }}
+          path: ${{ runner.os == 'macOS' && format('dist/nanyi12306-{0}.zip', matrix.name) || matrix.artifact }}
+          if-no-files-found: error

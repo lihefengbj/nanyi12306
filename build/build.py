@@ -22,9 +22,11 @@ def main() -> int:
         sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--clean", "--windowed",
         "--name", "nanyi12306",
-        "--add-data", resource_path(""),
         str(ROOT / "main.py"),
     ]
+    if (ROOT / "assets").is_dir():
+        args.insert(args.index(str(ROOT / "main.py")), "--add-data")
+        args.insert(args.index(str(ROOT / "main.py")), resource_path(""))
     if system == "Windows":
         args.insert(args.index("--windowed") + 1, "--onefile")
         if (ROOT / "assets" / "app.ico").exists():
